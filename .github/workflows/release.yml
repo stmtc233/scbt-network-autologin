@@ -11,6 +11,8 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    permissions: # 添加此部分来授予 GITHUB_TOKEN 创建 Release 的权限
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
