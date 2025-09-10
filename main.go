@@ -93,7 +93,7 @@ func postLogin(client *resty.Client, usrip string) string {
 		"passwd":         os.Getenv("PASSWORD"),
 		"treaty":         "on",
 		"nasid":          "4",
-		"usrmac":         os.Getenv("USER_MAC"), // 从环境变量读取MAC地址
+		"usrmac":         os.Getenv("DEVICE_MAC"), // 从环境变量读取MAC地址
 		"usrip":          usrip,
 		"basip":          "10.241.0.11",
 		"success":        ONSUCCESS_URL,
@@ -108,7 +108,7 @@ func postLogin(client *resty.Client, usrip string) string {
 			"passwd":         os.Getenv("PASSWORD"),
 			"treaty":         "on",
 			"nasid":          "4",
-			"usrmac":         os.Getenv("USER_MAC"), // 从环境变量读取MAC地址
+			"usrmac":         os.Getenv("DEVICE_MAC"), // 从环境变量读取MAC地址
 			"usrip":          usrip,
 			"basip":          "10.241.0.11",
 			"success":        ONSUCCESS_URL,
