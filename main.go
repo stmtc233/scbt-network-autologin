@@ -1,305 +1,153 @@
 package main
 
 import (
-	"bytes"
+	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
-	"net/http/cookiejar"
 	"os"
-	"strconv"
-	"strings"
-	"time"
-
-	"github.com/PuerkitoBio/goquery"
-	"github.com/go-resty/resty/v2"
-	"github.com/joho/godotenv"
+	"os/signal"
+	"sync"
+	"syscall"
 )
 
-var GETIP_URL = "http://www.qq.com/"
-var TEST_URL = "https://www.baidu.com/"
+var (
+	flagConfig = flag.String("c", "", "指定配置文件路径 (默认先寻找当前目录 config.json，再回退 .env)")
+	flagOnce   = flag.Bool("once", false, "单次执行模式：仅检查并登录一次，不常驻后台")
+	flagInit   = flag.Bool("init", false, "在当前目录下生成多拨配置模板 config.json")
+	flagManual = flag.Bool("manual", false, "纯手动模式：直接通过命令行参数登录单个接口")
 
-// var LOGIN_URL = "http://p.0086-10010.com:9770/lfradius/libs/portal/unify/portal.php/login/cmcc_login/"
-// var ONSUCCESS_URL = "http://p.0086-10010.com:9770/lfradius/libs/portal/unify/portal.php/login/success/"
-// var ONFAIL_URL = "http://p.0086-10010.com:9770/lfradius/libs/portal/unify/portal.php/login/fail/"
-// var CHECKSTATUS_URL = "http://p.0086-10010.com:9770/lfradius/libs/portal/unify/portal.php/login/cmcc_login_result/"
-var LOGIN_URL = "http://47.106.209.12:9770/lfradius/libs/portal/unify/portal.php/login/cmcc_login/"
-var ONSUCCESS_URL = "http://47.106.209.12:9770/lfradius/libs/portal/unify/portal.php/login/success/"
-var ONFAIL_URL = "http://47.106.209.12:9770/lfradius/libs/portal/unify/portal.php/login/fail/"
+	flagInterface = flag.String("i", "eth1", "手动模式: 网卡接口名称 (如 eth1, vwan1)")
+	flagUsername  = flag.String("u", "", "手动模式: 校园网账号用户名")
+	flagPassword  = flag.String("p", "", "手动模式: 校园网账号密码")
+	flagMAC       = flag.String("mac", "", "手动模式: 接口MAC地址 (留空自动获取)")
+	flagIP        = flag.String("ip", "", "手动模式: 接口IP地址 (留空自动获取)")
+	flagBasIP     = flag.String("basip", "", "手动模式: BAS IP (留空使用默认)")
+	flagNasID     = flag.String("nasid", "", "手动模式: NAS ID (留空使用默认)")
+)
 
-func isOnline() bool {
-	client := resty.New()
-	client.SetTimeout(5 * time.Second)
-	// 检查网络连通性时不走代理
-	client.RemoveProxy()
-	resp, err := client.R().Get(TEST_URL)
-	if err != nil {
-		return false
-	}
-	// 检查返回内容，防止被重定向到登录页
-	return resp.StatusCode() == 200 && strings.Contains(string(resp.Body()), "baidu")
-}
-
-// 修改后的Token解析函数，通过name属性更精确地查找
-func parseTokenFromHtml(html []byte) string {
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(html))
-	if err != nil {
-		return ""
-	}
-	// 通过 input 的 name 属性来查找，更准确
-	token, exists := doc.Find("input[name='cmcc_login_value']").Attr("value")
-	if !exists {
-		return ""
-	}
-	return token
-}
-
-func GetIPv4ByInterface(name string) string {
-	// 根据名称获取网络接口
-	iface, err := net.InterfaceByName(name)
-	if err != nil {
-		return ""
+func runManualMode() {
+	if *flagUsername == "" || *flagPassword == "" {
+		fmt.Println("错误: 手动模式必须提供 -u (用户名) 和 -p (密码)")
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	// 获取该接口的所有地址
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return ""
+	cfg := DefaultConfig()
+	if *flagBasIP != "" {
+		cfg.DefaultBasIP = *flagBasIP
+	}
+	if *flagNasID != "" {
+		cfg.DefaultNasID = *flagNasID
 	}
 
-	// 遍历所有地址
-	for _, addr := range addrs {
-		var ip net.IP
-		// 进行类型断言，判断地址是否为 IPNet 类型
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-			// 检查是否为IPv4地址
-			if ipNet.IP.To4() != nil {
-				ip = ipNet.IP
-			}
-		}
-
-		if ip != nil {
-			return ip.String()
-		}
-	}
-
-	return ""
-}
-
-// 第1步：提交用户名和密码，获取包含token的HTML和Cookies
-func postLogin(client *resty.Client, usrip string) string {
-	log.Println(map[string]string{
-		"usrname":        os.Getenv("USER_ID"),
-		"passwd":         os.Getenv("PASSWORD"),
-		"treaty":         "on",
-		"nasid":          "4",
-		"usrmac":         os.Getenv("DEVICE_MAC"), // 从环境变量读取MAC地址
-		"usrip":          usrip,
-		"basip":          "10.241.0.11",
-		"success":        ONSUCCESS_URL,
-		"fail":           ONFAIL_URL,
-		"offline":        "1",
-		"portal_version": "1",
-		"portal_papchap": "pap",
-	})
-	resp, err := client.R().
-		SetFormData(map[string]string{
-			"usrname":        os.Getenv("USER_ID"),
-			"passwd":         os.Getenv("PASSWORD"),
-			"treaty":         "on",
-			"nasid":          "4",
-			"usrmac":         os.Getenv("DEVICE_MAC"), // 从环境变量读取MAC地址
-			"usrip":          usrip,
-			"basip":          "10.241.0.11",
-			"success":        ONSUCCESS_URL,
-			"fail":           ONFAIL_URL,
-			"offline":        "1",
-			"portal_version": "1",
-			"portal_papchap": "pap",
-		}).Post(LOGIN_URL)
-
-	if err != nil {
-		log.Println("postLogin request error:", err)
-		return ""
-	}
-
-	if resp.StatusCode() == 200 {
-		// Cookies 会被自动保存在 client 的 CookieJar 中
-		// 现在从返回的HTML中解析出 token
-		return parseTokenFromHtml(resp.Body())
-	} else {
-		log.Printf("postLogin status code: %d", resp.StatusCode())
-		return ""
-	}
-}
-
-// 第2步：提交上一步获取到的token
-// 此时 client 已经自动带上了第1步获取的 Cookies
-func postToken(client *resty.Client, token string) bool {
-	resp, err := client.R().SetFormData(map[string]string{
-		"cmcc_login_value": token,
-	}).Post(LOGIN_URL) // 还是请求到同一个LOGIN_URL
-
-	if err != nil {
-		log.Println("postToken request error:", err)
-		return false
-	}
-	// 根据你的描述，这一步成功后会返回一个包含JS轮询的页面
-	return resp.StatusCode() == 200
-}
-
-// 第3步：轮询检查登录状态
-// func getStatus(client *resty.Client, token string) bool {
-// 	// 轮询最多10次，每次间隔2秒
-// 	for i := 0; i < 10; i++ {
-// 		resp, err := client.R().
-// 			SetFormData(map[string]string{
-// 				// 注意，这里的参数名是 "l"
-// 				"l": token,
-// 			}).Post(CHECKSTATUS_URL)
-
-// 		if err != nil {
-// 			log.Println("getStatus request error:", err)
-// 			// 网络错误，稍后重试
-// 			time.Sleep(2 * time.Second)
-// 			continue
-// 		}
-
-// 		if resp.StatusCode() == 200 && string(resp.Body()) == "success" {
-// 			return true
-// 		}
-// 		// 等待2秒再进行下一次查询
-// 		time.Sleep(2 * time.Second)
-// 	}
-// 	return false
-// }
-
-// 第4步：最终确认登录成功页面
-func checkStatus(client *resty.Client) bool {
-	resp, err := client.R().Get(ONSUCCESS_URL)
-	if err != nil {
-		log.Println("checkStatus request error:", err)
-		return false
-	}
-	// 检查状态码并且页面内容是否包含“登录成功”
-	return resp.StatusCode() == 200 && strings.Contains(string(resp.Body()), "登录成功")
-}
-
-// 整合的登录流程
-func login() (bool, string) {
-	// 创建一个 resty 客户端并启用 CookieJar 来自动管理 Cookies
-	jar, _ := cookiejar.New(nil)
-	client := resty.New().SetCookieJar(jar)
-
-	usrip := GetIPv4ByInterface(os.Getenv("INTERFACE_NAME"))
+	iface := *flagInterface
+	usrip := *flagIP
 	if usrip == "" {
-		// 如果无法自动获取IP，可以尝试使用环境变量中的备用IP
-		usrip = os.Getenv("USER_IP")
-		if usrip == "" {
-			return false, "无法获取用户IP，请在.env文件中配置USER_IP。"
-		}
-		printLog(fmt.Sprintf("无法自动获取IP，使用预设IP: %s", usrip))
+		usrip = GetIPv4ByInterface(iface)
+	}
+	if usrip == "" {
+		log.Fatalf("错误: 无法从接口 %s 获取IPv4地址，请确认网卡已连接或通过 -ip 手动指定", iface)
+	}
+
+	usrmac := *flagMAC
+	if usrmac == "" {
+		usrmac = GetMACByInterface(iface)
+	}
+
+	log.Printf("[手动模式] 接口: %s | IP: %s | MAC: %s | 账号: %s", iface, usrip, usrmac, MaskString(*flagUsername, 3, 2))
+
+	client := CreateClientForInterface(iface, net.ParseIP(usrip))
+	t := true
+	acc := &AccountConfig{
+		Name:      iface,
+		Interface: iface,
+		Username:  *flagUsername,
+		Password:  *flagPassword,
+		MAC:       usrmac,
+		IP:        usrip,
+		BasIP:     *flagBasIP,
+		NasID:     *flagNasID,
+		Enabled:   &t,
+	}
+
+	success, msg := Login(client, acc, cfg, usrip, usrmac)
+	if success {
+		log.Printf("[手动模式] 登录结果: 成功! (%s)", msg)
 	} else {
-		printLog(fmt.Sprintf("获取到当前IP: %s", usrip))
-	}
-
-	// 第1步：提交凭据，获取token
-	token := postLogin(client, usrip)
-	if token == "" {
-		return false, "步骤1失败: 无法正确获取Token。"
-	}
-	printLog("步骤1成功: 获取Token完成。")
-
-	// 第2步：提交token
-	if !postToken(client, token) {
-		return false, "步骤2失败: 无法提交登录状态。"
-	}
-	printLog("步骤2成功: 提交Token完成。")
-
-	// 第3步：轮询状态
-	// if !getStatus(client, token) {
-	// 	return false, "步骤3失败: 查询登录状态失败。"
-	// }
-	// printLog("步骤3成功: 查询登录状态成功。")
-
-	// 第4步：检查最终成功页面
-	if !checkStatus(client) {
-		return false, "步骤4失败: 最终状态检查失败。"
-	}
-	printLog("步骤4成功: 登录成功页面确认。")
-
-	return true, "登录成功."
-}
-
-func printLog(logStr string) {
-	log.Printf("%s | %s", time.Now().Format("2006-01-02 15:04:05"), logStr)
-}
-
-func mainLoop() {
-	checkInterval, err := strconv.ParseInt(os.Getenv("CHECK_INTERVAL"), 10, 64)
-	if err != nil {
-		checkInterval = 30 // 建议检测间隔长一些，比如30秒
-	}
-	retryMaxCount, err := strconv.ParseInt(os.Getenv("RETRY_MAXCOUNT"), 10, 64)
-	if err != nil {
-		retryMaxCount = 5
-	}
-	printLog("校园网自动认证程序已启动。")
-
-	// 启动时先检查一次网络状态
-	if isOnline() {
-		printLog("网络已在线，进入监控模式。")
-	} else {
-		printLog("网络离线，立即尝试登录。")
-		res, hint := login()
-		printLog(hint)
-		if res {
-			printLog("登录成功，进入监控模式。")
-		} else {
-			printLog("首次登录失败，将在后台继续尝试。")
-		}
-	}
-
-	count := 0
-	for {
-		// 每次循环都等待指定的时间
-		time.Sleep(time.Duration(checkInterval) * time.Second)
-
-		if isOnline() {
-			// 如果在线，重置重试计数器
-			count = 0
-			// printLog("网络在线，状态正常。") // 可以取消这行注释来获得心跳日志
-			continue
-		}
-
-		if count >= int(retryMaxCount) {
-			printLog(fmt.Sprintf("已达到最大重试次数(%d)，程序暂停10分钟后继续。", retryMaxCount))
-			time.Sleep(10 * time.Minute)
-			count = 0 // 暂停后重置计数器
-			continue
-		}
-
-		printLog(fmt.Sprintf("网络离线，正在进行第%d次重连...", count+1))
-		res, hint := login()
-		printLog(hint)
-
-		if res {
-			count = 0 // 登录成功后重置计数器
-			printLog("重连成功！")
-		} else {
-			count++
-			printLog("重连失败。")
-		}
+		log.Fatalf("[手动模式] 登录结果: 失败! (%s)", msg)
 	}
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
-		printLog("未找到.env文件，请确保环境变量已设置。")
-	} else {
-		printLog("已加载.env文件到环境变量中。")
+	flag.Parse()
+
+	log.SetFlags(log.Ldate | log.Ltime)
+
+	// 1. 初始化模板
+	if *flagInit {
+		if _, err := os.Stat("config.json"); err == nil {
+			fmt.Println("config.json 文件已存在，避免覆盖未执行操作。")
+			return
+		}
+		cfg := DefaultConfig()
+		if err := SaveConfig("config.json", cfg); err != nil {
+			log.Fatalf("生成配置文件失败: %v", err)
+		}
+		fmt.Println("已生成多拨配置文件模板: config.json")
+		fmt.Println("请编辑该文件填入你的多拨接口、账号和密码后再次运行。")
+		return
 	}
-	log.Println(GetIPv4ByInterface(os.Getenv("INTERFACE_NAME")))
-	mainLoop()
+
+	// 2. 命令行手动单次模式
+	if *flagManual {
+		runManualMode()
+		return
+	}
+
+	// 3. 读取配置文件 (优先 config.json / -c，其次 .env)
+	cfg, err := LoadConfig(*flagConfig)
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+
+	activeAccounts := make([]AccountConfig, 0)
+	for _, acc := range cfg.Accounts {
+		if acc.IsEnabled() {
+			activeAccounts = append(activeAccounts, acc)
+		}
+	}
+
+	if len(activeAccounts) == 0 {
+		log.Fatalf("错误: 配置文件中没有任何已启用的账号！")
+	}
+
+	log.Printf("================ 校园网多拨自动认证程序 ================")
+	log.Printf("共加载 %d 个有效多拨账号配置，检测周期: %d 秒，重试上限: %d 次",
+		len(activeAccounts), cfg.CheckInterval, cfg.RetryMaxCount)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("接收到退出信号 (%v)，正在停止所有接口监控...", sig)
+		cancel()
+	}()
+
+	var wg sync.WaitGroup
+	for _, acc := range activeAccounts {
+		wg.Add(1)
+		account := acc
+		go func() {
+			defer wg.Done()
+			RunAccountWorker(ctx, account, cfg, *flagOnce)
+		}()
+	}
+
+	wg.Wait()
+	log.Printf("所有认证任务已退出。")
 }

@@ -11,49 +11,57 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    permissions: # 添加此部分来授予 GITHUB_TOKEN 创建 Release 的权限
+    permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Go (根据你的项目语言调整)
+      - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'
+          go-version: '1.21'
+
+      # --- Generate default config.json for release package ---
+      - name: Prepare default config
+        run: |
+          go run . -init || true
 
       # --- Windows x64 Build ---
       - name: Build for Windows x64
         run: |
-          GOOS=windows GOARCH=amd64 go build -o myapp-windows-amd64.exe .
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o scbt-autologin-windows-amd64.exe .
       - name: Package Windows artifact
         run: |
-          mkdir -p release/myapp-windows-amd64
-          cp myapp-windows-amd64.exe release/myapp-windows-amd64/
-          cp .env release/myapp-windows-amd64/
-          zip -r myapp-windows-amd64.zip release/myapp-windows-amd64
+          mkdir -p release/scbt-windows-amd64
+          cp scbt-autologin-windows-amd64.exe release/scbt-windows-amd64/
+          cp config.json release/scbt-windows-amd64/ || true
+          cp .env release/scbt-windows-amd64/ || true
+          zip -r scbt-windows-amd64.zip release/scbt-windows-amd64
 
       # --- Linux x64 Build ---
       - name: Build for Linux x64
         run: |
-          GOOS=linux GOARCH=amd64 go build -o myapp-linux-amd64 .
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o scbt-autologin-linux-amd64 .
       - name: Package Linux x64 artifact
         run: |
-          mkdir -p release/myapp-linux-amd64
-          cp myapp-linux-amd64 release/myapp-linux-amd64/
-          cp .env release/myapp-linux-amd64/
-          tar -czvf myapp-linux-amd64.tar.gz -C release/myapp-linux-amd64 .
+          mkdir -p release/scbt-linux-amd64
+          cp scbt-autologin-linux-amd64 release/scbt-linux-amd64/
+          cp config.json release/scbt-linux-amd64/ || true
+          cp .env release/scbt-linux-amd64/ || true
+          tar -czvf scbt-linux-amd64.tar.gz -C release/scbt-linux-amd64 .
 
       # --- Linux arm64 Build ---
       - name: Build for Linux arm64
         run: |
-          GOOS=linux GOARCH=arm64 go build -o myapp-linux-arm64 .
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o scbt-autologin-linux-arm64 .
       - name: Package Linux arm64 artifact
         run: |
-          mkdir -p release/myapp-linux-arm64
-          cp myapp-linux-arm64 release/myapp-linux-arm64/
-          cp .env release/myapp-linux-arm64/
-          tar -czvf myapp-linux-arm64.tar.gz -C release/myapp-linux-arm64 .
+          mkdir -p release/scbt-linux-arm64
+          cp scbt-autologin-linux-arm64 release/scbt-linux-arm64/
+          cp config.json release/scbt-linux-arm64/ || true
+          cp .env release/scbt-linux-arm64/ || true
+          tar -czvf scbt-linux-arm64.tar.gz -C release/scbt-linux-arm64 .
 
       # --- Create Release and Upload Artifacts ---
       - name: Create Release
@@ -73,8 +81,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./myapp-windows-amd64.zip
-          asset_name: myapp-windows-amd64.zip
+          asset_path: ./scbt-windows-amd64.zip
+          asset_name: scbt-windows-amd64.zip
           asset_content_type: application/zip
 
       - name: Upload Linux x64 Asset
@@ -83,8 +91,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./myapp-linux-amd64.tar.gz
-          asset_name: myapp-linux-amd64.tar.gz
+          asset_path: ./scbt-linux-amd64.tar.gz
+          asset_name: scbt-linux-amd64.tar.gz
           asset_content_type: application/gzip
 
       - name: Upload Linux arm64 Asset
@@ -93,6 +101,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./myapp-linux-arm64.tar.gz
-          asset_name: myapp-linux-arm64.tar.gz
+          asset_path: ./scbt-linux-arm64.tar.gz
+          asset_name: scbt-linux-arm64.tar.gz
           asset_content_type: application/gzip

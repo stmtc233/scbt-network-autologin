@@ -1,2 +1,8 @@
 scbt-network-autologin
+scbt-network-autologin-*
+*.exe
+*.zip
+*.tar.gz
 by.bat
+release/
+config.json
