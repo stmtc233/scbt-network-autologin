@@ -1,110 +1,120 @@
-# SCBT 校园网自动认证程序 (支持单拨/多拨)
+# SCBT 校园网自动认证程序 (支持单拨/多拨/大账号池轮询)
 
-针对高校/园区 CMCC Portal 认证系统的自动登录与多拨守护程序。支持单账号常驻、单线多拨（Macvlan / MWAN3）多接口并发认证、断线自动重连，以及全手动配置。
+针对高校/园区 CMCC Portal 认证系统的自动登录与多拨守护程序。支持单账号常驻、单线多拨（Macvlan / MWAN3）多接口并发认证、海量账号 CSV 账号池自动轮换、智能跨端口断线判定，以及主账号流量优先级控制。
 
 ---
 
 ## ✨ 核心特性
 
-- **多拨多接口并发支持**：支持 `eth1`、`vwan1`、`vwan2` 等多个虚拟网卡同时登录不同账号，互不干扰。
-- **严格网卡物理/逻辑绑定**：采用 Linux `SO_BINDTODEVICE` 与源 IP 双重绑定机制，确保认证和检测请求 100% 走指定的物理/虚拟网卡，完美适配 OpenWrt MWAN3 分流。
-- **断线自动重连**：针对每个网卡独立监测网络连通性，离线秒级发现并自动重连，支持指数重试与失败暂停机制。
-- **智能免密/信息自适应**：自动从网卡读取 MAC 地址与 DHCP 分配的 IPv4 地址；同时支持在配置文件中手动强制指定。
-- **全手动/自动化兼备**：
-  - **守护模式**：加载 `config.json` 或 `.env` 后台多线程监控。
-  - **单次模式 (`-once`)**：执行一次全网卡检测与登录后即刻退出，便于集成到 hotplug / cron。
-  - **手动单跑 (`-manual`)**：无需配置文件，直接通过命令行参数对指定网卡执行登录。
-- **向下完全兼容**：若目录中无 `config.json` 但存在 `.env`，会自动回退为单账号老版本模式。
+- **海量账号 CSV 账号池**：支持导入包含数十上百个账号的 `accounts.csv` 文件，自动管理账号生命周期（空闲待用、使用中、异常冷却、自动跳过已过期账号）。
+- **智能跨端口存活检测与故障切换 (Failover)**：
+  - **单端口掉线识别**：当某个端口掉线时，自动检测其他端口状态。若其他端口正常在线，说明校园网整体畅通，判定为当前账号被踢下线、欠费或到期，**立即自动切换到下一个未使用的账号**登录，保障网口不中断。
+  - **全局断网保护**：若所有端口均掉线，程序智能判定为校园网整体断网（夜间断网/机房维护/网线松脱），**绝不盲目轮换耗尽账号池**，保持当前账号静候网络恢复。
+- **主账号指定与流量优先级保证**：
+  - 配置文件中可指定唯一 `primary_account` 与 `primary_interface`（如 `eth1`）。
+  - 主账号专属绑定到主网卡，开启 `set_traffic_priority` 后自动在 Linux/OpenWrt 内核中维持最低路由跃点（`metric 10`），确保局域网所有设备的日常网络与游戏流量优先走主账号端口。
+- **严格网卡物理/逻辑绑定**：采用 Linux `SO_BINDTODEVICE` 与源 IP 双重绑定机制，确保认证和连通性检测报文 100% 严格走指定物理/虚拟网口，不受 MWAN3 策略路由干扰。
+- **多种运行模式**：
+  - **守护模式**：多端口后台常驻监控与自动重连。
+  - **单次模式 (`-once`)**：执行一次全网卡检测/登录后即刻退出，适合集成到 hotplug / crontab。
+  - **纯手动模式 (`-manual`)**：直接在命令行指定接口和学号密码登录，无需配置文件。
 
 ---
 
-## 🚀 快速使用
+## 📋 配置文件与账号格式
 
-### 1. 生成配置文件模板
+### 1. 账号池文件 (`accounts.csv`)
 
-```bash
-./scbt-network-autologin -init
+支持标准的 CSV 格式，首行包含表头即可自动识别字段：
+
+```csv
+"学号","密码","套餐","过期时间"
+"255102010828","094217","100M包学期2终端-学生","2030-10-31 00:00:00"
+"255602130329","257607","100M包学期2终端-学生","2030-10-31 00:00:00"
+"255801020304","123456","100M包学期2终端-学生","2030-10-31 00:00:00"
 ```
-执行后会在当前目录生成 `config.json` 模板文件。
 
-### 2. 编辑配置文件 (`config.json`)
+> **说明**：
+> - 表头支持中文（`学号`、`密码`、`套餐`、`过期时间`）或英文（`username`、`password` 等）。
+> - 若账号已过“过期时间”，程序会在启动时自动识别并跳过，防止无效认证。
+
+### 2. 主配置文件 (`config.json`)
 
 ```json
 {
+  "csv_file": "accounts.csv",
+  "primary_account": "255102010828",
+  "primary_interface": "eth1",
+  "set_traffic_priority": true,
   "check_interval": 15,
-  "retry_maxcount": 5,
+  "retry_maxcount": 3,
   "test_url": "https://www.baidu.com/",
   "login_url": "http://47.106.209.12:9770/lfradius/libs/portal/unify/portal.php/login/cmcc_login/",
   "success_url": "http://47.106.209.12:9770/lfradius/libs/portal/unify/portal.php/login/success/",
   "fail_url": "http://47.106.209.12:9770/lfradius/libs/portal/unify/portal.php/login/fail/",
   "default_basip": "10.241.0.11",
   "default_nasid": "4",
-  "accounts": [
+  "interfaces": [
     {
       "name": "主WAN",
       "interface": "eth1",
-      "username": "13000000001",
-      "password": "your_password_1",
-      "mac": "",
-      "ip": "",
+      "is_primary": true,
       "enabled": true
     },
     {
-      "name": "多拨WAN2",
+      "name": "副WAN1",
       "interface": "vwan1",
-      "username": "13000000002",
-      "password": "your_password_2",
-      "mac": "",
-      "ip": "",
+      "is_primary": false,
       "enabled": true
+    },
+    {
+      "name": "副WAN2",
+      "interface": "vwan2",
+      "is_primary": false,
+      "enabled": false
     }
   ]
 }
 ```
 
 > **字段说明**：
-> - `interface`: 绑定的网络接口（如物理网卡 `eth1`，或 macvlan 虚拟网卡 `vwan1`）。
-> - `username` / `password`: 对应网卡要登录的校园网账号与密码。
-> - `mac`: 手动指定的 MAC 地址（留空则自动从该接口网卡读取真实/虚拟 MAC）。
-> - `ip`: 手动指定的 IP 地址（留空则自动读取 DHCP 获取到的 IPv4）。
-> - `enabled`: 是否启用该账号监控（`true` / `false`）。
+> - `csv_file`: 存放账号的 CSV 文件路径。
+> - `primary_account`: 主账号学号。如果留空，默认使用 CSV 中第 1 个有效账号。
+> - `primary_interface`: 主网卡名称（通常为物理 WAN 口 `eth1`）。
+> - `set_traffic_priority`: 是否自动将主网卡默认路由 metric 设为 10，让路由器优先走主端口。
+> - `interfaces`: 要监听的多拨接口列表。`mac` 和 `ip` 留空即可，会自动从网卡读取。
 
-### 3. 运行程序
+---
+
+## 🚀 常用运行命令
 
 ```bash
-# 后台监控常驻运行 (默认读取 config.json)
+# 一键生成 accounts.csv 与 config.json 模板
+./scbt-network-autologin -init
+
+# 正常前台运行（监控所有已启用的接口）
 ./scbt-network-autologin
 
-# 指定配置文件路径
-./scbt-network-autologin -c /etc/scbt/config.json
+# 指定配置文件或 CSV 文件
+./scbt-network-autologin -c /root/a/config.json -csv /root/a/accounts.csv
 
-# 单次检测登录模式 (常用于 OpenWrt ifup hotplug 脚本或调试)
+# 单次执行模式 (检测/登录后立即退出)
 ./scbt-network-autologin -once
 
-# 纯手动模式：直接通过命令行登录指定网卡
-./scbt-network-autologin -manual -i vwan1 -u 13000000002 -p mypassword
+# 纯手动模式 (直接命令行单跑指定接口)
+./scbt-network-autologin -manual -i vwan1 -u 255102010828 -p 094217
 ```
 
 ---
 
-## 🛠️ OpenWrt 单线多拨配置简明指引
+## 🛠️ OpenWrt 服务化管理
 
-1. **安装 macvlan**：
-   ```bash
-   opkg update && opkg install kmod-macvlan mwan3 luci-app-mwan3
-   ```
-2. **在 `/etc/config/network` 创建虚拟 WAN 接口**：
-   ```uci
-   config device
-       option name 'vwan1'
-       option type 'macvlan'
-       option ifname 'eth1'
-       option mode 'vepa'
-       option macaddr '82:af:ca:b5:2a:93'
+在 OpenWrt 路由器上，可通过内置的 procd 服务管理：
 
-   config interface 'vwan1'
-       option proto 'dhcp'
-       option device 'vwan1'
-   ```
-3. 在 `config.json` 中配置对应的 `vwan1` 与对应账号密码。
-4. 运行 `scbt-network-autologin`，即可完成全自动的多拨登录。
+```bash
+service scbt-autologin start    # 启动后台守护
+service scbt-autologin stop     # 停止服务
+service scbt-autologin restart  # 重启服务
+service scbt-autologin enable   # 设置开机自启
+logread -f | grep scbt          # 查看实时认证和切号日志
+```

@@ -14,8 +14,9 @@ import (
 
 var (
 	flagConfig = flag.String("c", "", "指定配置文件路径 (默认先寻找当前目录 config.json，再回退 .env)")
+	flagCSV    = flag.String("csv", "", "指定账号CSV文件路径 (覆盖 config.json 中的 csv_file)")
 	flagOnce   = flag.Bool("once", false, "单次执行模式：仅检查并登录一次，不常驻后台")
-	flagInit   = flag.Bool("init", false, "在当前目录下生成多拨配置模板 config.json")
+	flagInit   = flag.Bool("init", false, "生成多拨配置模板 config.json 与账号池模板 accounts.csv")
 	flagManual = flag.Bool("manual", false, "纯手动模式：直接通过命令行参数登录单个接口")
 
 	flagInterface = flag.String("i", "eth1", "手动模式: 网卡接口名称 (如 eth1, vwan1)")
@@ -59,20 +60,7 @@ func runManualMode() {
 	log.Printf("[手动模式] 接口: %s | IP: %s | MAC: %s | 账号: %s", iface, usrip, usrmac, MaskString(*flagUsername, 3, 2))
 
 	client := CreateClientForInterface(iface, net.ParseIP(usrip))
-	t := true
-	acc := &AccountConfig{
-		Name:      iface,
-		Interface: iface,
-		Username:  *flagUsername,
-		Password:  *flagPassword,
-		MAC:       usrmac,
-		IP:        usrip,
-		BasIP:     *flagBasIP,
-		NasID:     *flagNasID,
-		Enabled:   &t,
-	}
-
-	success, msg := Login(client, acc, cfg, usrip, usrmac)
+	success, msg := LoginAccount(client, *flagUsername, *flagPassword, *flagBasIP, *flagNasID, cfg, usrip, usrmac)
 	if success {
 		log.Printf("[手动模式] 登录结果: 成功! (%s)", msg)
 	} else {
@@ -87,16 +75,10 @@ func main() {
 
 	// 1. 初始化模板
 	if *flagInit {
-		if _, err := os.Stat("config.json"); err == nil {
-			fmt.Println("config.json 文件已存在，避免覆盖未执行操作。")
-			return
+		if err := InitTemplates(); err != nil {
+			log.Fatalf("初始化模板失败: %v", err)
 		}
-		cfg := DefaultConfig()
-		if err := SaveConfig("config.json", cfg); err != nil {
-			log.Fatalf("生成配置文件失败: %v", err)
-		}
-		fmt.Println("已生成多拨配置文件模板: config.json")
-		fmt.Println("请编辑该文件填入你的多拨接口、账号和密码后再次运行。")
+		fmt.Println("请编辑 accounts.csv 填入你的所有账号，并在 config.json 中配置要启用的网卡接口。")
 		return
 	}
 
@@ -106,26 +88,73 @@ func main() {
 		return
 	}
 
-	// 3. 读取配置文件 (优先 config.json / -c，其次 .env)
+	// 3. 读取配置文件
 	cfg, err := LoadConfig(*flagConfig)
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 
-	activeAccounts := make([]AccountConfig, 0)
-	for _, acc := range cfg.Accounts {
-		if acc.IsEnabled() {
-			activeAccounts = append(activeAccounts, acc)
+	// 4. 读取账号数据 (优先 CSV 格式，其次 config.json accounts 数组或 .env)
+	csvPath := cfg.CSVFile
+	if *flagCSV != "" {
+		csvPath = *flagCSV
+	}
+
+	var accounts []*Account
+	if csvPath != "" {
+		if _, err := os.Stat(csvPath); err == nil {
+			accs, err := LoadAccountsFromCSV(csvPath, cfg.PrimaryAccount)
+			if err != nil {
+				log.Fatalf("从CSV文件 %s 加载账号失败: %v", csvPath, err)
+			}
+			accounts = accs
+			log.Printf("成功从 %s 加载 %d 个账号，指定主账号: [%s]",
+				csvPath, len(accounts), MaskString(cfg.PrimaryAccount, 3, 2))
 		}
 	}
 
-	if len(activeAccounts) == 0 {
-		log.Fatalf("错误: 配置文件中没有任何已启用的账号！")
+	// 回退：如果无 CSV，使用 cfg.Accounts
+	if len(accounts) == 0 {
+		for _, acc := range cfg.Accounts {
+			if acc.IsEnabled() {
+				isPrim := (acc.Username == cfg.PrimaryAccount) || len(accounts) == 0
+				accounts = append(accounts, &Account{
+					Username:  acc.Username,
+					Password:  acc.Password,
+					IsPrimary: isPrim,
+					Status:    AccountStatusIdle,
+				})
+			}
+		}
 	}
 
-	log.Printf("================ 校园网多拨自动认证程序 ================")
-	log.Printf("共加载 %d 个有效多拨账号配置，检测周期: %d 秒，重试上限: %d 次",
-		len(activeAccounts), cfg.CheckInterval, cfg.RetryMaxCount)
+	if len(accounts) == 0 {
+		log.Fatalf("错误: 未找到任何可用账号！请在 accounts.csv 或 config.json 中配置账号。")
+	}
+
+	// 5. 初始化账号池与跨端口协调器
+	pool := NewAccountPool(accounts)
+	coord := NewCoordinator(cfg.CheckInterval)
+
+	activeInterfaces := make([]InterfaceConfig, 0)
+	for _, iface := range cfg.Interfaces {
+		if iface.IsEnabled() {
+			if iface.Interface == cfg.PrimaryInterface {
+				iface.IsPrimary = true
+			}
+			activeInterfaces = append(activeInterfaces, iface)
+		}
+	}
+
+	if len(activeInterfaces) == 0 {
+		log.Fatalf("错误: 没有启用任何监控接口！请在 config.json 的 interfaces 数组中启用至少一个网卡。")
+	}
+
+	log.Printf("================ 校园网多拨智能认证守护程序 ================")
+	log.Printf("已就绪网卡: %d 个 (主端口: %s, 流量优先: %v)",
+		len(activeInterfaces), cfg.PrimaryInterface, cfg.SetTrafficPriority)
+	log.Printf("账号池规模: [%s]", pool.GetStats())
+	log.Printf("检测周期: %d 秒，重试上限: %d 次", cfg.CheckInterval, cfg.RetryMaxCount)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -139,15 +168,15 @@ func main() {
 	}()
 
 	var wg sync.WaitGroup
-	for _, acc := range activeAccounts {
+	for _, iface := range activeInterfaces {
 		wg.Add(1)
-		account := acc
+		ifaceCfg := iface
 		go func() {
 			defer wg.Done()
-			RunAccountWorker(ctx, account, cfg, *flagOnce)
+			RunPortWorker(ctx, ifaceCfg, pool, coord, cfg, *flagOnce)
 		}()
 	}
 
 	wg.Wait()
-	log.Printf("所有认证任务已退出。")
+	log.Printf("所有接口认证任务已退出。")
 }

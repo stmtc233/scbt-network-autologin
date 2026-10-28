@@ -33,19 +33,17 @@ func parseTokenFromHtml(html []byte) string {
 	return strings.TrimSpace(token)
 }
 
-func postLogin(client *resty.Client, acc *AccountConfig, cfg *Config, usrip, usrmac string) (string, error) {
-	basip := acc.BasIP
+func postLoginRaw(client *resty.Client, username, password, basip, nasid string, cfg *Config, usrip, usrmac string) (string, error) {
 	if basip == "" {
 		basip = cfg.DefaultBasIP
 	}
-	nasid := acc.NasID
 	if nasid == "" {
 		nasid = cfg.DefaultNasID
 	}
 
 	formData := map[string]string{
-		"usrname":        acc.Username,
-		"passwd":         acc.Password,
+		"usrname":        username,
+		"passwd":         password,
 		"treaty":         "on",
 		"nasid":          nasid,
 		"usrmac":         usrmac,
@@ -102,9 +100,9 @@ func checkStatus(client *resty.Client, successURL string) bool {
 	return resp.StatusCode() == 200 && strings.Contains(string(resp.Body()), "登录成功")
 }
 
-func Login(client *resty.Client, acc *AccountConfig, cfg *Config, usrip, usrmac string) (bool, string) {
+func LoginAccount(client *resty.Client, username, password, basip, nasid string, cfg *Config, usrip, usrmac string) (bool, string) {
 	// 步骤 1: 提交凭据，获取 Token
-	token, err := postLogin(client, acc, cfg, usrip, usrmac)
+	token, err := postLoginRaw(client, username, password, basip, nasid, cfg, usrip, usrmac)
 	if err != nil {
 		return false, fmt.Sprintf("步骤1失败: %v", err)
 	}
@@ -130,4 +128,20 @@ func Login(client *resty.Client, acc *AccountConfig, cfg *Config, usrip, usrmac 
 	}
 
 	return true, "登录成功"
+}
+
+func Login(client *resty.Client, acc *Account, cfg *Config, usrip, usrmac string) (bool, string) {
+	return LoginAccount(client, acc.Username, acc.Password, cfg.DefaultBasIP, cfg.DefaultNasID, cfg, usrip, usrmac)
+}
+
+func LoginLegacy(client *resty.Client, acc *AccountConfig, cfg *Config, usrip, usrmac string) (bool, string) {
+	basip := acc.BasIP
+	if basip == "" {
+		basip = cfg.DefaultBasIP
+	}
+	nasid := acc.NasID
+	if nasid == "" {
+		nasid = cfg.DefaultNasID
+	}
+	return LoginAccount(client, acc.Username, acc.Password, basip, nasid, cfg, usrip, usrmac)
 }

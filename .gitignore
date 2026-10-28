@@ -6,3 +6,4 @@ scbt-network-autologin-*
 by.bat
 release/
 config.json
+*.csv
