@@ -30,10 +30,10 @@ func parseExpireTime(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Account, error) {
+func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Account, []string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("读取CSV文件 %s 失败: %w", filePath, err)
+		return nil, nil, fmt.Errorf("读取CSV文件 %s 失败: %w", filePath, err)
 	}
 
 	// 去除 UTF-8 BOM
@@ -45,11 +45,11 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 
 	records, err := reader.ReadAll()
 	if err != nil {
-		return nil, fmt.Errorf("解析CSV内容失败: %w", err)
+		return nil, nil, fmt.Errorf("解析CSV内容失败: %w", err)
 	}
 
 	if len(records) == 0 {
-		return nil, fmt.Errorf("CSV文件为空")
+		return nil, nil, fmt.Errorf("CSV文件为空")
 	}
 
 	colUser := 0
@@ -60,10 +60,11 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 	startRow := 0
 	firstRow := records[0]
 	hasHeader := false
+	var header []string
 
 	for i, col := range firstRow {
 		cleanCol := strings.TrimSpace(strings.ToLower(col))
-		if strings.Contains(cleanCol, "学号") || strings.Contains(cleanCol, "账号") || strings.Contains(cleanCol, "user") {
+		if strings.Contains(cleanCol, "学号") || strings.Contains(cleanCol, "账号") || strings.Contains(cleanCol, "用户名") || strings.Contains(cleanCol, "user") {
 			colUser = i
 			hasHeader = true
 		} else if strings.Contains(cleanCol, "密码") || strings.Contains(cleanCol, "pass") {
@@ -72,7 +73,10 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 		} else if strings.Contains(cleanCol, "套餐") || strings.Contains(cleanCol, "pkg") || strings.Contains(cleanCol, "plan") {
 			colPkg = i
 			hasHeader = true
-		} else if strings.Contains(cleanCol, "过期") || strings.Contains(cleanCol, "expire") || strings.Contains(cleanCol, "时间") {
+		} else if strings.Contains(cleanCol, "到期") || strings.Contains(cleanCol, "过期") || strings.Contains(cleanCol, "expire") {
+			colExp = i
+			hasHeader = true
+		} else if colExp < 0 && strings.Contains(cleanCol, "时间") {
 			colExp = i
 			hasHeader = true
 		}
@@ -80,6 +84,7 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 
 	if hasHeader {
 		startRow = 1
+		header = firstRow
 	}
 
 	var accounts []*Account
@@ -114,6 +119,11 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 			}
 		}
 
+		if isExpired {
+			// 过期账号直接忽略
+			continue
+		}
+
 		acc := &Account{
 			Username:   user,
 			Password:   pass,
@@ -121,11 +131,7 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 			ExpireStr:  expStr,
 			ExpireTime: expTime,
 			Status:     AccountStatusIdle,
-		}
-
-		if isExpired {
-			acc.Status = AccountStatusExpired
-			acc.FailReason = fmt.Sprintf("账号已于 %s 过期", expStr)
+			RawRow:     row,
 		}
 
 		if user == primaryAccountUsername {
@@ -136,7 +142,7 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 	}
 
 	if len(accounts) == 0 {
-		return nil, fmt.Errorf("CSV文件中未找到有效账号数据")
+		return nil, nil, fmt.Errorf("CSV文件中未找到有效账号数据")
 	}
 
 	// 如果未指定主账号，默认将第一个未过期的账号指定为主账号
@@ -156,5 +162,5 @@ func LoadAccountsFromCSV(filePath string, primaryAccountUsername string) ([]*Acc
 		}
 	}
 
-	return accounts, nil
+	return accounts, header, nil
 }

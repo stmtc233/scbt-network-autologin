@@ -56,13 +56,15 @@ func CreateClientForInterface(ifaceName string, localIP net.IP) *resty.Client {
 		dialer.LocalAddr = &net.TCPAddr{IP: localIP}
 	}
 
-	if ifaceName != "" {
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			_ = c.Control(func(fd uintptr) {
+	dialer.Control = func(network, address string, c syscall.RawConn) error {
+		_ = c.Control(func(fd uintptr) {
+			if ifaceName != "" {
 				_ = bindToDevice(fd, ifaceName)
-			})
-			return nil
-		}
+			}
+			// 关键：打上 0x3f00 旁路标记，彻底免疫 MWAN3 策略分流与串口冲突
+			_ = setSocketMark(fd, 0x3f00)
+		})
+		return nil
 	}
 
 	transport := &http.Transport{

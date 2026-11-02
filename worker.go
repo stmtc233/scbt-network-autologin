@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,7 @@ func RunPortWorker(ctx context.Context, ifaceCfg InterfaceConfig, pool *AccountP
 
 	var lastIP string
 	portFailCount := 0
+	accFailCount := 0
 
 	for {
 		select {
@@ -80,6 +82,9 @@ func RunPortWorker(ctx context.Context, ifaceCfg InterfaceConfig, pool *AccountP
 		if currentIP != lastIP {
 			logWorker(label, "当前IP: %s | MAC: %s", currentIP, currentMAC)
 			lastIP = currentIP
+			_ = EnsureInterfaceRouting(ifaceCfg.Interface, currentIP, isPrimary)
+		} else {
+			_ = EnsureInterfaceRouting(ifaceCfg.Interface, currentIP, isPrimary)
 		}
 
 		// 3. 创建绑定该网卡接口的独立 HTTP Client
@@ -93,9 +98,7 @@ func RunPortWorker(ctx context.Context, ifaceCfg InterfaceConfig, pool *AccountP
 			if portFailCount > 0 {
 				logWorker(label, "接口网络恢复正常在线状态！")
 				portFailCount = 0
-			}
-			if isPrimary && cfg.SetTrafficPriority {
-				_ = EnsureInterfaceMetric(ifaceCfg.Interface, 10)
+				accFailCount = 0
 			}
 			if once {
 				logWorker(label, "接口已在线，单次检测完成。")
@@ -109,20 +112,63 @@ func RunPortWorker(ctx context.Context, ifaceCfg InterfaceConfig, pool *AccountP
 			}
 		}
 
-		// 5. 当前接口离线，进行跨端口存活交叉分析 (核心多拨智能判断)
-		portFailCount++
-		otherTotal, otherOnline := coord.GetOtherPortsStatus(ifaceCfg.Interface)
-
+		// 5. 当前接口离线，首先确保分配可用账号
 		currentUsername := "未分配"
+		if currentAcc == nil {
+			if isPrimary {
+				currentAcc, _ = pool.AcquirePrimaryAccount(ifaceCfg.Interface)
+			} else {
+				// 先检查账号池是否有空闲账号，没有就静默等待，绝不盲目轮换 MAC 导致接口反复震荡
+				nextAcc, err := pool.AcquireNextUnusedAccount(ifaceCfg.Interface)
+				if err != nil {
+					if once {
+						return
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Duration(cfg.CheckInterval) * time.Second):
+						continue
+					}
+				}
+				// 确实有新账号，才轮换 MAC 准备认证
+				_, _ = RotateInterfaceMAC(ifaceCfg.Interface)
+				currentMAC = GetMACByInterface(ifaceCfg.Interface)
+				currentIP = GetIPv4ByInterface(ifaceCfg.Interface)
+				client = CreateClientForInterface(ifaceCfg.Interface, net.ParseIP(currentIP))
+				_ = EnsureInterfaceRouting(ifaceCfg.Interface, currentIP, isPrimary)
+				currentAcc = nextAcc
+			}
+			if currentAcc != nil {
+				coord.SetPortAccount(ifaceCfg.Interface, currentAcc)
+				accFailCount = 0
+			}
+		}
+
+		portFailCount++
+		accFailCount++
 		if currentAcc != nil {
 			currentUsername = MaskString(currentAcc.Username, 3, 2)
 		}
 
-		// 情况 A: 其他所有端口也全部离线 (otherTotal > 0 且 otherOnline == 0)
-		// 说明是校园网整体断网（如机房维护、物理网线松脱、夜间断网），切勿乱换账号！
-		if otherTotal > 0 && otherOnline == 0 {
-			logWorker(label, "检测到接口离线，但其他所有接口 (%d个) 也均处于离线状态！判定为校园网整体中断，保持当前账号 [%s]，等待网络恢复...",
-				otherTotal, currentUsername)
+		loginSuccess := false
+		var lastLoginMsg string
+		if currentAcc != nil {
+			logWorker(label, "接口未在线，使用账号 [%s] 尝试认证登录 (尝试第%d次)...", currentUsername, accFailCount)
+			success, msg := Login(client, currentAcc, cfg, currentIP, currentMAC)
+			lastLoginMsg = msg
+			if success {
+				logWorker(label, "账号 [%s] 认证登录成功: %s", currentUsername, msg)
+				coord.UpdatePortStatus(ifaceCfg.Interface, true, currentIP, currentMAC)
+				portFailCount = 0
+				accFailCount = 0
+				loginSuccess = true
+			} else {
+				logWorker(label, "账号 [%s] 认证登录未通过: %s", currentUsername, msg)
+			}
+		}
+
+		if loginSuccess {
 			if once {
 				return
 			}
@@ -134,112 +180,80 @@ func RunPortWorker(ctx context.Context, ifaceCfg InterfaceConfig, pool *AccountP
 			}
 		}
 
-		// 情况 B: 仅当前端口离线，而其他至少一个端口正常在线！
-		// 确凿证明校园网完全通畅，当前网卡离线 100% 是由于该账号被踢下线、欠费或并发受限！
-		if otherTotal > 0 && otherOnline > 0 {
-			logWorker(label, "检测到仅当前接口离线（其他 %d 个接口正常在线）！判定当前账号 [%s] 失效或被踢下线",
-				otherOnline, currentUsername)
+		// 6. 当前账号认证失败，进行轮换与多拨智能判断
+		maxRetries := cfg.RetryMaxCount
+		if maxRetries <= 0 || maxRetries > 3 {
+			maxRetries = 2
+		}
 
-			// 先尝试使用当前账号快速重连一次 (应对偶尔的Portal会话超时)
-			reconnectSuccess := false
-			if currentAcc != nil && portFailCount <= 1 {
-				logWorker(label, "尝试使用原账号 [%s] 重新认证一次...", currentUsername)
-				s, m := Login(client, currentAcc, cfg, currentIP, currentMAC)
-				if s {
-					logWorker(label, "原账号重新认证成功: %s", m)
-					coord.UpdatePortStatus(ifaceCfg.Interface, true, currentIP, currentMAC)
-					if isPrimary && cfg.SetTrafficPriority {
-						_ = EnsureInterfaceMetric(ifaceCfg.Interface, 10)
-					}
-					portFailCount = 0
-					reconnectSuccess = true
-				}
-			}
+		// 明确不可用账号特征：并发受限、欠费停机、认证拒绝等，直接判定不可用，无需等待
+		isAccountUnusable := strings.Contains(lastLoginMsg, "其他终端在线") ||
+			strings.Contains(lastLoginMsg, "外网测试未通") ||
+			strings.Contains(lastLoginMsg, "691") ||
+			strings.Contains(lastLoginMsg, "停机") ||
+			strings.Contains(lastLoginMsg, "欠费") ||
+			strings.Contains(lastLoginMsg, "不存在") ||
+			strings.Contains(lastLoginMsg, "密码错误")
 
-			if reconnectSuccess {
-				if once {
-					return
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(time.Duration(cfg.CheckInterval) * time.Second):
-					continue
-				}
-			}
+		// 瞬时物理网络抖动 (仅连接拒绝/路由不可达/超时)
+		isNetworkGlitch := strings.Contains(lastLoginMsg, "网络请求错误") ||
+			strings.Contains(lastLoginMsg, "connect:") ||
+			strings.Contains(lastLoginMsg, "timeout")
 
-			// 原账号重连无效：立即切换到下一个未使用的账号！
-			logWorker(label, "当前账号不可用，标记为失败并切换到下一个未使用的空闲账号...")
+		otherTotal, otherOnline := coord.GetOtherPortsStatus(ifaceCfg.Interface)
+
+		// 主账号不随意轮换；普通子网卡只要重试达上限或明确账号不可用，直接换账号！
+		shouldSwitchAccount := !isPrimary && (isAccountUnusable || accFailCount >= maxRetries)
+
+		// 特殊情况保护：如果是瞬时底层网络中断且其他端口也全挂了，可能是物理拔线，等待重试
+		if isNetworkGlitch && otherTotal > 0 && otherOnline == 0 && accFailCount < maxRetries {
+			shouldSwitchAccount = false
+		}
+
+		if shouldSwitchAccount {
+			logWorker(label, "账号 [%s] 认证失败或不可用 (%s, 累计尝试%d次)，从列表废弃...",
+				currentUsername, lastLoginMsg, accFailCount)
 			if currentAcc != nil {
-				pool.MarkAccountFailed(currentAcc, "单端口异常掉线且重连失败")
+				pool.RemoveInvalidAccount(currentAcc, "认证失败废弃: "+lastLoginMsg)
 			}
+			currentAcc = nil
 
+			// 检查是否还有下一个可用账号
 			nextAcc, err := pool.AcquireNextUnusedAccount(ifaceCfg.Interface)
 			if err != nil {
-				logWorker(label, "切换账号失败: %v。账号池状态: [%s]", err, pool.GetStats())
-				if once {
-					return
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(15 * time.Second):
-					continue
-				}
-			}
-
-			currentAcc = nextAcc
-			coord.SetPortAccount(ifaceCfg.Interface, currentAcc)
-			logWorker(label, "成功切换为新账号: [%s] (套餐: %s, 过期时间: %s)，正在执行认证...",
-				MaskString(currentAcc.Username, 3, 2), currentAcc.Package, currentAcc.ExpireStr)
-
-			success, msg := Login(client, currentAcc, cfg, currentIP, currentMAC)
-			if success {
-				logWorker(label, "新账号 [%s] 认证成功: %s", MaskString(currentAcc.Username, 3, 2), msg)
-				coord.UpdatePortStatus(ifaceCfg.Interface, true, currentIP, currentMAC)
-				if isPrimary && cfg.SetTrafficPriority {
-					_ = EnsureInterfaceMetric(ifaceCfg.Interface, 10)
-				}
-				portFailCount = 0
+				logWorker(label, "账号池中暂无其他空闲账号，接口保持待命...")
 			} else {
-				logWorker(label, "新账号 [%s] 认证失败: %s", MaskString(currentAcc.Username, 3, 2), msg)
-				pool.MarkAccountFailed(currentAcc, msg)
-			}
-
-			if once {
-				return
-			}
-			time.Sleep(3 * time.Second)
-			continue
-		}
-
-		// 情况 C: 仅配置了单端口 (otherTotal == 0)
-		if currentAcc == nil {
-			currentAcc, _ = pool.AcquireNextUnusedAccount(ifaceCfg.Interface)
-			coord.SetPortAccount(ifaceCfg.Interface, currentAcc)
-		}
-
-		if currentAcc != nil {
-			if portFailCount > cfg.RetryMaxCount {
-				logWorker(label, "当前账号 [%s] 连续失败达到上限(%d次)，切换到下一个未使用的账号...",
-					MaskString(currentAcc.Username, 3, 2), cfg.RetryMaxCount)
-				pool.MarkAccountFailed(currentAcc, "连续失败达上限")
-				nextAcc, err := pool.AcquireNextUnusedAccount(ifaceCfg.Interface)
-				if err == nil {
-					currentAcc = nextAcc
-					coord.SetPortAccount(ifaceCfg.Interface, currentAcc)
-					portFailCount = 1
+				// 确实有新账号可用，才执行 MAC 轮换并立即认证
+				_, _ = RotateInterfaceMAC(ifaceCfg.Interface)
+				currentMAC = GetMACByInterface(ifaceCfg.Interface)
+				currentIP = GetIPv4ByInterface(ifaceCfg.Interface)
+				client = CreateClientForInterface(ifaceCfg.Interface, net.ParseIP(currentIP))
+				_ = EnsureInterfaceRouting(ifaceCfg.Interface, currentIP, isPrimary)
+				currentAcc = nextAcc
+				coord.SetPortAccount(ifaceCfg.Interface, currentAcc)
+				accFailCount = 0
+				currentUsername = MaskString(currentAcc.Username, 3, 2)
+				logWorker(label, "成功切换为新账号: [%s] (新MAC: %s, 新IP: %s)，立即尝试认证...",
+					currentUsername, currentMAC, currentIP)
+				s, m := Login(client, currentAcc, cfg, currentIP, currentMAC)
+				if s {
+					logWorker(label, "新账号 [%s] 认证登录成功: %s", currentUsername, m)
+					coord.UpdatePortStatus(ifaceCfg.Interface, true, currentIP, currentMAC)
+					portFailCount = 0
+					accFailCount = 0
+				} else {
+					logWorker(label, "新账号 [%s] 认证初次尝试未通过: %s", currentUsername, m)
+					accFailCount = 1
+					if strings.Contains(m, "其他终端在线") || strings.Contains(m, "外网测试未通") || strings.Contains(m, "691") || strings.Contains(m, "停机") || strings.Contains(m, "欠费") || strings.Contains(m, "不存在") || strings.Contains(m, "密码错误") {
+						pool.RemoveInvalidAccount(currentAcc, m)
+						currentAcc = nil
+					}
 				}
 			}
-
-			logWorker(label, "正在进行第 %d 次认证尝试 (账号: %s)...", portFailCount, MaskString(currentAcc.Username, 3, 2))
-			success, msg := Login(client, currentAcc, cfg, currentIP, currentMAC)
-			if success {
-				logWorker(label, "认证成功: %s", msg)
-				coord.UpdatePortStatus(ifaceCfg.Interface, true, currentIP, currentMAC)
-				portFailCount = 0
-			} else {
-				logWorker(label, "认证失败: %s", msg)
+		} else {
+			if !isPrimary {
+				logWorker(label, "账号 [%s] 暂时保持，等待下个周期重试 (%d/%d)...",
+					currentUsername, accFailCount, maxRetries)
 			}
 		}
 
@@ -250,6 +264,7 @@ func RunPortWorker(ctx context.Context, ifaceCfg InterfaceConfig, pool *AccountP
 		case <-ctx.Done():
 			return
 		case <-time.After(time.Duration(cfg.CheckInterval) * time.Second):
+			continue
 		}
 	}
 }

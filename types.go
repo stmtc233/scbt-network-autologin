@@ -24,6 +24,7 @@ type Account struct {
 	FailedAt   time.Time     `json:"failed_at,omitempty"`
 	FailReason string        `json:"fail_reason,omitempty"`
 	InUseBy    string        `json:"in_use_by,omitempty"` // 正在使用此账号的接口名 (如 eth1)
+	RawRow     []string      `json:"-"`
 }
 
 type InterfaceConfig struct {

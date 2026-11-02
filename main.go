@@ -101,13 +101,15 @@ func main() {
 	}
 
 	var accounts []*Account
+	var csvHeader []string
 	if csvPath != "" {
 		if _, err := os.Stat(csvPath); err == nil {
-			accs, err := LoadAccountsFromCSV(csvPath, cfg.PrimaryAccount)
+			accs, hdr, err := LoadAccountsFromCSV(csvPath, cfg.PrimaryAccount)
 			if err != nil {
 				log.Fatalf("从CSV文件 %s 加载账号失败: %v", csvPath, err)
 			}
 			accounts = accs
+			csvHeader = hdr
 			log.Printf("成功从 %s 加载 %d 个账号，指定主账号: [%s]",
 				csvPath, len(accounts), MaskString(cfg.PrimaryAccount, 3, 2))
 		}
@@ -133,7 +135,7 @@ func main() {
 	}
 
 	// 5. 初始化账号池与跨端口协调器
-	pool := NewAccountPool(accounts)
+	pool := NewAccountPool(csvPath, csvHeader, accounts)
 	coord := NewCoordinator(cfg.CheckInterval)
 
 	activeInterfaces := make([]InterfaceConfig, 0)

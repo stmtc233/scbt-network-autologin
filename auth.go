@@ -18,7 +18,29 @@ func IsOnline(client *resty.Client, testURL string) bool {
 	if err != nil {
 		return false
 	}
-	return resp.StatusCode() == 200 && strings.Contains(string(resp.Body()), "baidu")
+	body := string(resp.Body())
+
+	// 如果包含校园网 Portal 拦截页面或691欠费页面特征，坚决判定为未登录/离线
+	if strings.Contains(body, "Web认证") ||
+		strings.Contains(body, "0086-10010.com") ||
+		strings.Contains(body, "wlanacip") ||
+		strings.Contains(body, "wlanacname") ||
+		strings.Contains(body, "cmcc_login") ||
+		strings.Contains(body, "lfradius") ||
+		strings.Contains(body, "691.gd165.com") ||
+		strings.Contains(body, "691错误") ||
+		strings.Contains(body, "callForErrByName") ||
+		strings.Contains(body, "停机状态") ||
+		strings.Contains(body, "error_arrears") {
+		return false
+	}
+
+	// 真实连通性特征：响应正常且包含百度真实特征 (防止将包含 url=baidu 的重定向页误认为在线)
+	if resp.StatusCode() == 200 && (strings.Contains(body, "百度一下") || strings.Contains(body, "hao123") || len(body) > 1000) {
+		return true
+	}
+
+	return false
 }
 
 func parseTokenFromHtml(html []byte) string {
@@ -107,7 +129,10 @@ func LoginAccount(client *resty.Client, username, password, basip, nasid string,
 		return false, fmt.Sprintf("步骤1失败: %v", err)
 	}
 	if token == "ALREADY_ONLINE" {
-		return true, "账号检测到已处于在线状态"
+		if IsOnline(client, cfg.TestURL) {
+			return true, "账号检测到已处于在线状态且外网验证通过"
+		}
+		return false, "账号在其他终端在线(并发受限)，本机未获得外网放行"
 	}
 
 	// 步骤 2: 提交 Token
@@ -116,18 +141,23 @@ func LoginAccount(client *resty.Client, username, password, basip, nasid string,
 	}
 
 	// 稍作停顿让 RADIUS / BAS 状态生效
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 
-	// 步骤 4: 检查最终登录状态页面
-	if !checkStatus(client, cfg.SuccessURL) {
-		// 容错：如果最终状态页未返回“登录成功”，用网络测试兜底确认
+	// 步骤 3: 严格真实外网连通性验证 (防止Portal虚假成功或欠费691拦截)
+	verified := false
+	for i := 0; i < 5; i++ {
 		if IsOnline(client, cfg.TestURL) {
-			return true, "登录成功 (外网连通性验证通过)"
+			verified = true
+			break
 		}
-		return false, "步骤4失败: 成功页面状态校验未通过"
+		time.Sleep(1 * time.Second)
 	}
 
-	return true, "登录成功"
+	if !verified {
+		return false, "Portal认证通过但外网测试未通 (可能宽带欠费停机691或BAS未放行)"
+	}
+
+	return true, "登录成功 (外网连通性验证通过)"
 }
 
 func Login(client *resty.Client, acc *Account, cfg *Config, usrip, usrmac string) (bool, string) {
